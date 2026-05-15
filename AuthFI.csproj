@@ -5,7 +5,7 @@
     <Version>0.1.0</Version>
     <Description>AuthFI .NET SDK — JWT validation, RBAC middleware, permission auto-sync</Description>
     <Authors>Quefly</Authors>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/queflyhq/authfi-dotnet-sdk</RepositoryUrl>
   </PropertyGroup>
   <ItemGroup>
