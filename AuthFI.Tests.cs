@@ -1,13 +1,26 @@
 // AuthFI .NET SDK Tests
 // Run: dotnet test (after setting up test project)
-// Or verify manually with: dotnet script AuthFI.Tests.cs
+//
+// NOTE: These tests require the .NET SDK (dotnet) which is NOT installed in the
+// authoring environment, so they have not been executed here — they are written
+// to compile and pass under `dotnet test` / the bundled runner below.
+//
+// The signature-verification tests spin up a tiny in-process HTTP server
+// (HttpListener) that serves a JWKS document at the AuthFI well-known path
+// (<apiUrl>/v1/<tenant>/.well-known/jwks.json) and point the SDK at it via the
+// apiUrl constructor argument. Tokens are minted with JsonWebTokenHandler so the
+// "valid" case carries a real RS256 signature over the published key.
 
 #if false // Uncomment when running as xunit test project
 using Xunit;
 #endif
 
+using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.IdentityModel.JsonWebTokens;
+using Microsoft.IdentityModel.Tokens;
 
 namespace AuthFI.Tests;
 
@@ -18,16 +31,104 @@ namespace AuthFI.Tests;
 /// </summary>
 public class AuthFIClientTests
 {
-    private static string MakeToken(object payload)
+    private const string Tenant = "acme";
+    private const string Issuer = "https://acme.authfi.app";
+    private const string Kid = "test-key-1";
+
+    /// <summary>
+    /// A self-contained signing harness: an RSA key, a JWKS endpoint that publishes
+    /// it, and a helper to mint RS256-signed tokens. Disposing it stops the server.
+    /// </summary>
+    private sealed class TestIssuer : IDisposable
     {
-        var header = Convert.ToBase64String(Encoding.UTF8.GetBytes("{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"test-key-1\"}"))
-            .TrimEnd('=').Replace('+', '-').Replace('/', '_');
-        var body = Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload)))
-            .TrimEnd('=').Replace('+', '-').Replace('/', '_');
-        var sig = Convert.ToBase64String(Encoding.UTF8.GetBytes("fakesig"))
-            .TrimEnd('=').Replace('+', '-').Replace('/', '_');
-        return $"{header}.{body}.{sig}";
+        private readonly HttpListener _listener;
+        private readonly RsaSecurityKey _signingKey;
+        public string ApiUrl { get; }
+
+        public TestIssuer(RSA? publishKey = null, RSA? signKey = null, string kid = Kid)
+        {
+            var rsaSign = signKey ?? RSA.Create(2048);
+            // By default the same key is published and used for signing. Tests that
+            // want a forged signature pass a *different* publishKey.
+            var rsaPublish = publishKey ?? rsaSign;
+
+            _signingKey = new RsaSecurityKey(rsaSign) { KeyId = kid };
+
+            var jwk = JsonWebKeyConverter.ConvertFromSecurityKey(
+                new RsaSecurityKey(rsaPublish) { KeyId = kid });
+            jwk.Use = "sig";
+            jwk.Alg = SecurityAlgorithms.RsaSha256;
+            var jwksJson = JsonSerializer.Serialize(new { keys = new[] { jwk } });
+
+            // Bind to an ephemeral port. The SDK requests
+            //   {ApiUrl}/v1/{tenant}/.well-known/jwks.json
+            var port = GetFreePort();
+            ApiUrl = $"http://localhost:{port}";
+            _listener = new HttpListener();
+            _listener.Prefixes.Add($"{ApiUrl}/");
+            _listener.Start();
+            _ = ServeAsync(jwksJson);
+        }
+
+        private async Task ServeAsync(string jwksJson)
+        {
+            var bytes = Encoding.UTF8.GetBytes(jwksJson);
+            while (_listener.IsListening)
+            {
+                HttpListenerContext ctx;
+                try { ctx = await _listener.GetContextAsync(); }
+                catch { break; } // listener stopped
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.OutputStream.WriteAsync(bytes);
+                ctx.Response.Close();
+            }
+        }
+
+        public string MintToken(object claims)
+        {
+            var handler = new JsonWebTokenHandler { SetDefaultTimesOnTokenCreation = false };
+            var descriptor = new SecurityTokenDescriptor
+            {
+                Issuer = Issuer,
+                Claims = ToClaimMap(claims),
+                SigningCredentials = new SigningCredentials(_signingKey, SecurityAlgorithms.RsaSha256),
+            };
+            return handler.CreateToken(descriptor);
+        }
+
+        private static Dictionary<string, object> ToClaimMap(object claims)
+        {
+            var json = JsonSerializer.Serialize(claims);
+            return JsonSerializer.Deserialize<Dictionary<string, object>>(json)!;
+        }
+
+        private static int GetFreePort()
+        {
+            var l = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+            l.Start();
+            var port = ((IPEndPoint)l.LocalEndpoint).Port;
+            l.Stop();
+            return port;
+        }
+
+        public void Dispose()
+        {
+            try { _listener.Stop(); } catch { }
+            try { _listener.Close(); } catch { }
+        }
     }
+
+    private static object ValidClaims(long? exp = null) => new
+    {
+        sub = "usr_123",
+        email = "jane@acme.com",
+        name = "Jane Smith",
+        roles = new[] { "admin", "editor" },
+        permissions = new[] { "read:users", "write:users" },
+        tenant_id = "tnt_456",
+        exp = exp ?? DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds(),
+        iat = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+    };
 
     // --- Initialization ---
 
@@ -45,27 +146,69 @@ public class AuthFIClientTests
         AssertThrows<AuthFIException>(() => auth.VerifyToken("not-a-jwt"), 401);
     }
 
-    public static void TestRejectsExpiredToken()
+    public static void TestDecodesValidPayload()
     {
-        var auth = new AuthFIClient("acme", "sk_test");
-        var token = MakeToken(new { Sub = "usr_123", Exp = DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeSeconds() });
+        using var issuer = new TestIssuer();
+        var auth = new AuthFIClient(Tenant, "sk_test", issuer.ApiUrl);
+
+        var token = issuer.MintToken(ValidClaims());
+        var claims = auth.VerifyToken(token);
+
+        Assert(claims.Sub == "usr_123", "sub should be usr_123");
+        Assert(claims.Email == "jane@acme.com", "email should match");
+        Assert(claims.Roles.Length == 2, "should have 2 roles");
+        Assert(claims.Permissions.Length == 2, "should have 2 permissions");
+        Assert(claims.TenantId == "tnt_456", "tenant_id should match");
+    }
+
+    public static void TestRejectsTamperedToken()
+    {
+        using var issuer = new TestIssuer();
+        var auth = new AuthFIClient(Tenant, "sk_test", issuer.ApiUrl);
+
+        var token = issuer.MintToken(ValidClaims());
+
+        // Tamper with the payload: flip "usr_123" -> "usr_999" without re-signing.
+        var parts = token.Split('.');
+        var payloadJson = Encoding.UTF8.GetString(Base64UrlDecode(parts[1]))
+            .Replace("usr_123", "usr_999");
+        parts[1] = Base64UrlEncode(Encoding.UTF8.GetBytes(payloadJson));
+        var tampered = string.Join('.', parts);
+
+        AssertThrows<AuthFIException>(() => auth.VerifyToken(tampered), 401);
+    }
+
+    public static void TestRejectsForgedSignature()
+    {
+        // Token is signed with a key that is NOT the one published in the JWKS.
+        using var issuer = new TestIssuer(publishKey: RSA.Create(2048), signKey: RSA.Create(2048));
+        var auth = new AuthFIClient(Tenant, "sk_test", issuer.ApiUrl);
+
+        var token = issuer.MintToken(ValidClaims());
+
         AssertThrows<AuthFIException>(() => auth.VerifyToken(token), 401);
     }
 
-    public static void TestDecodesValidPayload()
+    public static void TestRejectsExpiredToken()
     {
-        var auth = new AuthFIClient("acme", "sk_test");
-        var token = MakeToken(new
-        {
-            Sub = "usr_123",
-            Email = "jane@acme.com",
-            Roles = new[] { "admin", "editor" },
-            Permissions = new[] { "read:users", "write:users" },
-            Exp = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeSeconds()
-        });
-        var claims = auth.VerifyToken(token);
-        Assert(claims.Sub == "usr_123", "sub should be usr_123");
-        Assert(claims.Email == "jane@acme.com", "email should match");
+        using var issuer = new TestIssuer();
+        var auth = new AuthFIClient(Tenant, "sk_test", issuer.ApiUrl);
+
+        // Expired well beyond the 60s clock-skew allowance.
+        var token = issuer.MintToken(ValidClaims(exp: DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeSeconds()));
+
+        AssertThrows<AuthFIException>(() => auth.VerifyToken(token), 401);
+    }
+
+    public static void TestRejectsWrongIssuer()
+    {
+        using var issuer = new TestIssuer();
+        // SDK configured for a different tenant -> expected issuer differs.
+        var auth = new AuthFIClient("other-tenant", "sk_test", issuer.ApiUrl);
+
+        var token = issuer.MintToken(ValidClaims());
+
+        AssertThrows<AuthFIException>(() => auth.VerifyToken(token), 401);
     }
 
     // --- Permission checks ---
@@ -148,8 +291,11 @@ public class AuthFIClientTests
         {
             ("creates instance", TestCreatesInstance),
             ("rejects invalid format", TestRejectsInvalidFormat),
+            ("decodes valid (signed) payload", TestDecodesValidPayload),
+            ("rejects tampered token", TestRejectsTamperedToken),
+            ("rejects forged signature", TestRejectsForgedSignature),
             ("rejects expired token", TestRejectsExpiredToken),
-            ("decodes valid payload", TestDecodesValidPayload),
+            ("rejects wrong issuer", TestRejectsWrongIssuer),
             ("passes with matching permissions", TestPassesWithMatchingPermissions),
             ("raises on missing permission", TestRaisesOnMissingPermission),
             ("handles empty permissions", TestHandlesEmptyPermissions),
@@ -162,8 +308,8 @@ public class AuthFIClientTests
 
         foreach (var (name, fn) in tests)
         {
-            try { fn(); Console.WriteLine($"  ✓ {name}"); passed++; }
-            catch (Exception ex) { Console.WriteLine($"  ✗ {name} — {ex.Message}"); failed++; }
+            try { fn(); Console.WriteLine($"  PASS {name}"); passed++; }
+            catch (Exception ex) { Console.WriteLine($"  FAIL {name} - {ex.Message}"); failed++; }
         }
 
         Console.WriteLine($"\n{new string('=', 40)}");
@@ -191,4 +337,14 @@ public class AuthFIClientTests
                 throw new Exception($"Expected status {expectedStatus}, got {ae.Status}");
         }
     }
+
+    private static byte[] Base64UrlDecode(string input)
+    {
+        var s = input.Replace('-', '+').Replace('_', '/');
+        switch (s.Length % 4) { case 2: s += "=="; break; case 3: s += "="; break; }
+        return Convert.FromBase64String(s);
+    }
+
+    private static string Base64UrlEncode(byte[] input) =>
+        Convert.ToBase64String(input).TrimEnd('=').Replace('+', '-').Replace('/', '_');
 }
