@@ -35,16 +35,16 @@ public class AuthFIClient
     private readonly JsonWebTokenHandler _tokenHandler = new();
     private readonly JwksCache _jwks;
 
-    public AuthFIClient(string tenant, string apiKey, string apiUrl = "https://api.authfi.app", string? applicationId = null)
+    public AuthFIClient(string tenant, string apiKey, string apiUrl = "https://api.authfi.io", string? applicationId = null)
     {
         _tenant = tenant;
         _apiKey = apiKey;
         _apiUrl = apiUrl.TrimEnd('/');
         _applicationId = applicationId;
 
-        // AuthFI issues tokens under https://<tenant>.authfi.app and publishes its
+        // AuthFI issues tokens under https://<tenant>.authfi.io and publishes its
         // signing keys at <apiUrl>/v1/<tenant>/.well-known/jwks.json (see other SDKs).
-        _issuer = $"https://{tenant}.authfi.app";
+        _issuer = $"https://{tenant}.authfi.io";
         _jwksUrl = $"{_apiUrl}/v1/{tenant}/.well-known/jwks.json";
         _jwks = new JwksCache(_http, _jwksUrl);
     }

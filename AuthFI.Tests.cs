@@ -32,7 +32,7 @@ namespace AuthFI.Tests;
 public class AuthFIClientTests
 {
     private const string Tenant = "acme";
-    private const string Issuer = "https://acme.authfi.app";
+    private const string Issuer = "https://acme.authfi.io";
     private const string Kid = "test-key-1";
 
     /// <summary>

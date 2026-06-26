@@ -1,6 +1,6 @@
 # AuthFI .NET SDK
 
-Official .NET SDK for [AuthFI](https://authfi.app) — the identity control plane.
+Official .NET SDK for [AuthFI](https://authfi.io) — the identity control plane.
 
 ## Install
 
