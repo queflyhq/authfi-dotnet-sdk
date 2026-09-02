@@ -45,7 +45,9 @@ public class AuthFIClient
         // AuthFI issues tokens under https://<tenant>.authfi.io and publishes its
         // signing keys at <apiUrl>/v1/<tenant>/.well-known/jwks.json (see other SDKs).
         _issuer = $"https://{tenant}.authfi.io";
-        _jwksUrl = $"{_apiUrl}/v1/{tenant}/.well-known/jwks.json";
+        // JWKS hangs off the TENANT BASE, not /v1. The edge dispatch is
+        // api.authfi.io/<slug>/<path> — the slug comes FIRST.
+        _jwksUrl = $"{_apiUrl}/{tenant}/.well-known/jwks.json";
         _jwks = new JwksCache(_http, _jwksUrl);
     }
 
@@ -155,7 +157,7 @@ public class AuthFIClient
             application_id = _applicationId
         };
 
-        var req = new HttpRequestMessage(HttpMethod.Put, $"{_apiUrl}/manage/v1/{_tenant}/permissions/sync")
+        var req = new HttpRequestMessage(HttpMethod.Put, $"{_apiUrl}/{_tenant}/v1/permissions/sync")
         {
             Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json")
         };

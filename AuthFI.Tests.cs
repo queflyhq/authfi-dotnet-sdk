@@ -61,7 +61,7 @@ public class AuthFIClientTests
             var jwksJson = JsonSerializer.Serialize(new { keys = new[] { jwk } });
 
             // Bind to an ephemeral port. The SDK requests
-            //   {ApiUrl}/v1/{tenant}/.well-known/jwks.json
+            //   {ApiUrl}/{tenant}/v1/.well-known/jwks.json
             var port = GetFreePort();
             ApiUrl = $"http://localhost:{port}";
             _listener = new HttpListener();
